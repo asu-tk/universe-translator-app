@@ -1,73 +1,74 @@
 import streamlit as st
 import os
+import json
+import tempfile
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 import deepl
-from dotenv import load_dotenv
 
 # ── ページ設定 ──
-st.set_page_config(page_title="UniVerse－YouTube多言語翻訳アプリ", layout="wide")
+st.set_page_config(page_title="UniVerse — YouTube多言語翻訳アプリ", layout="wide")
+st.title("UniVerse — YouTube多言語翻訳アプリ")
 
-# ── タイトル表示 ──
-st.title("UniVerse－YouTube多言語翻訳アプリ")
-
-# ── 初期設定 ──
-load_dotenv()
+# ── OAuth & DeepL の設定 ──
 SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"]
+# GitHub Secrets から読み出し
+CLIENT_SECRET_JSON = st.secrets["CLIENT_SECRET_JSON"]
+DEEPL_KEY          = st.secrets["DEEPL_API_KEY"]
 
 # ── YouTube カテゴリ一覧（日本語名称: ID） ──
 CATEGORY_MAP = {
-    "エンターテイメント": "24", "ゲーム": "20", "コメディ": "23", "スポーツ": "17",
-    "ニュースと政治": "25", "ハウツーとスタイル": "26", "ブログ": "22", "ペットと動物": "15",
-    "映画とアニメ": "1",  "音楽": "10", "科学と美術": "28", "教育": "27",
-    "自動車と乗り物": "2", "非営利団体と社会活動": "29", "旅行とイベント": "19"
+    "エンターテイメント": "24",
+    "ゲーム":               "20",
+    "コメディ":           "23",
+    "スポーツ":           "17",
+    "ニュースと政治":     "25",
+    "ハウツーとスタイル": "26",
+    "ブログ":             "22",
+    "ペットと動物":       "15",
+    "映画とアニメ":       "1",
+    "音楽":               "10",
+    "科学と美術":         "28",
+    "教育":               "27",
+    "自動車と乗り物":     "2",
+    "非営利団体と社会活動":"29",
+    "旅行とイベント":     "19"
 }
 
-# ── ユーザー入力フォーム ──
-youtube_secrets = st.text_input(
-    "client_secret.json のパス",
-    value=os.getenv("YOUTUBE_CLIENT_SECRETS", "client_secret.json")
-)
-deepl_key = st.text_input("DeepL APIキー", type="password")
-video_url  = st.text_input("YouTube 動画URLまたはID")
+# ── ユーザー入力 ──
+video_url     = st.text_input("📺 YouTube 動画 URL または ID")
+category_name = st.selectbox("🎯 動画のカテゴリを選択", list(CATEGORY_MAP.keys()))
+category_id   = CATEGORY_MAP[category_name]
 
-# ── カテゴリ選択 ──
-category_name = st.selectbox(
-    "動画のカテゴリを選択",
-    list(CATEGORY_MAP.keys()),
-    index=0
-)
-category_id = CATEGORY_MAP[category_name]
-
-if st.button("翻訳＆アップロード開始"):
-    # 入力チェック
-    if not youtube_secrets or not deepl_key or not video_url:
-        st.error("⚠️ すべての項目を埋めてください。")
+if st.button("🚀 翻訳＆アップロード開始"):
+    if not video_url:
+        st.error("⚠️ まず動画 URL または ID を入力してください。")
         st.stop()
 
-    # 動画ID抽出
-    video_id = video_url.split("v=")[-1] if "v=" in video_url else video_url.strip()
+    # —————— 1) client_secret.json を一時ファイルに書き出し ——————
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fp:
+        fp.write(CLIENT_SECRET_JSON)
+        secrets_path = fp.name
 
-    # Google OAuth 認証
+    # —————— 2) YouTube OAuth 認証 ——————
     try:
-        flow = InstalledAppFlow.from_client_secrets_file(youtube_secrets, SCOPES)
+        flow = InstalledAppFlow.from_client_secrets_file(secrets_path, SCOPES)
         creds = flow.run_local_server(port=0)
         youtube = build("youtube", "v3", credentials=creds)
-        st.success("✅ Google 認証 成功")
     except Exception as e:
-        st.error(f"🚫 Google 認証エラー: {e}")
+        st.error(f"🚫 Google 認証エラー：{e}")
         st.stop()
 
-    # DeepL 認証
+    # —————— 3) DeepL 認証 ——————
     try:
-        translator = deepl.Translator(deepl_key)
-        st.success("✅ DeepL 認証 成功")
+        translator = deepl.Translator(DEEPL_KEY)
     except Exception as e:
-        st.error(f"🚫 DeepL 認証エラー: {e}")
+        st.error(f"🚫 DeepL 認証エラー：{e}")
         st.stop()
 
-    # 元タイトル・説明取得
-    resp = youtube.videos().list(part="snippet", id=video_id).execute()
+    # —————— 4) 元タイトル＆説明取得 ——————
+    vid = video_url.split("v=")[-1] if "v=" in video_url else video_url.strip()
+    resp = youtube.videos().list(part="snippet", id=vid).execute()
     if not resp.get("items"):
         st.error("⚠️ 動画が見つかりません。IDを確認してください。")
         st.stop()
@@ -75,45 +76,35 @@ if st.button("翻訳＆アップロード開始"):
     orig_title = snippet.get("title", "")
     orig_desc  = snippet.get("description", "")
 
-    st.subheader("■ 元のタイトル／説明")
+    # —————— 5) 翻訳 ——————
+    trans_title = translator.translate_text(orig_title, target_lang="JA").text
+    trans_desc  = translator.translate_text(orig_desc,  target_lang="JA").text
+
+    # —————— 6) 表示 ——————
+    st.subheader("■ 元タイトル")
     st.write(orig_title)
-    st.write(orig_desc)
+    st.subheader("■ 翻訳後タイトル")
+    st.write(trans_title)
+    st.subheader("■ 翻訳後説明文")
+    st.write(trans_desc)
 
-    # 他言語ローカライズ構築
-    st.subheader("■ 翻訳ステータス")
-    localizations = {}
-    DEEPL_TO_YT = {
-        "BG":"bg","CS":"cs","DA":"da","DE":"de","EL":"el",
-        "EN-US":"en","EN-GB":"en","ES":"es","ET":"et","FI":"fi",
-        "FR":"fr","HU":"hu","ID":"id","IT":"it","KO":"ko",
-        "LT":"lt","LV":"lv","NB":"no","NL":"nl","PL":"pl",
-        "PT-BR":"pt","PT-PT":"pt","RO":"ro","RU":"ru","SK":"sk",
-        "SL":"sl","SV":"sv","TR":"tr","UK":"uk","ZH":"zh"
-    }
-    for dl_code, yt_code in DEEPL_TO_YT.items():
-        try:
-            t_title = translator.translate_text(orig_title, target_lang=dl_code).text
-            t_desc  = translator.translate_text(orig_desc, target_lang=dl_code).text
-            localizations[yt_code] = {"title": t_title, "description": t_desc}
-            st.write(f"- {dl_code} → {yt_code}: 翻訳OK")
-        except Exception as e:
-            st.write(f"- {dl_code}: エラー ({e})")
-
-    # ── YouTube 更新 ──
+    # —————— 7) YouTube 更新 ——————
     try:
         youtube.videos().update(
             part="snippet,localizations",
             body={
-                "id": video_id,
+                "id": vid,
                 "snippet": {
                     "title": orig_title,
                     "description": orig_desc,
                     "categoryId": category_id,
                     "defaultLanguage": "ja"
                 },
-                "localizations": localizations
+                "localizations": {
+                    "ja": {"title": trans_title, "description": trans_desc}
+                }
             }
         ).execute()
-        st.success("🚀 アップロード完了！")
+        st.success("✅ YouTube へのアップロードに成功しました！")
     except Exception as e:
-        st.error(f"❌ アップロードエラー: {e}")
+        st.error(f"❌ アップロードエラー：{e}")
