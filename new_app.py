@@ -80,17 +80,33 @@ if st.button("🚀 翻訳＆アップロード開始"):
     orig_title = snippet.get("title", "")
     orig_desc = snippet.get("description", "")
 
-    # ——— 翻訳 ———
-    trans_title = translator.translate_text(orig_title, target_lang="JA").text
-    trans_desc = translator.translate_text(orig_desc, target_lang="JA").text
+    # ——— 多言語翻訳対象言語（DeepL対応） ———
+    TARGET_LANGS = [
+        "BG", "CS", "DA", "DE", "EL", "EN", "ES", "ET", "FI", "FR", "HU", "ID", "IT",
+        "JA", "KO", "LT", "LV", "NB", "NL", "PL", "PT", "RO", "RU", "SK", "SL", "SV",
+        "TR", "UK", "ZH"
+    ]
 
-    # ——— 表示 ———
+    localizations = {}
+
+    for lang in TARGET_LANGS:
+        try:
+            trans_title = translator.translate_text(orig_title, target_lang=lang).text
+            trans_desc = translator.translate_text(orig_desc, target_lang=lang).text
+            localizations[lang.lower()] = {
+                "title": trans_title,
+                "description": trans_desc
+            }
+        except Exception as e:
+            st.warning(f"{lang} の翻訳に失敗しました: {e}")
+
+    # ——— 表示（例：日本語） ———
     st.subheader("■ 元タイトル")
     st.write(orig_title)
-    st.subheader("■ 翻訳後タイトル")
-    st.write(trans_title)
-    st.subheader("■ 翻訳後説明文")
-    st.write(trans_desc)
+    st.subheader("■ 翻訳後タイトル（日本語）")
+    st.write(localizations.get("ja", {}).get("title", ""))
+    st.subheader("■ 翻訳後説明文（日本語）")
+    st.write(localizations.get("ja", {}).get("description", ""))
 
     # ——— アップロード ———
     try:
@@ -104,14 +120,9 @@ if st.button("🚀 翻訳＆アップロード開始"):
                     "categoryId": CATEGORY_MAP[category],
                     "defaultLanguage": "ja"
                 },
-                "localizations": {
-                    "ja": {
-                        "title": trans_title,
-                        "description": trans_desc
-                    }
-                }
+                "localizations": localizations
             }
         ).execute()
-        st.success("✅ YouTube へのアップロードに成功しました！")
+        st.success("✅ 多言語でYouTubeへのアップロードに成功しました！")
     except Exception as e:
         st.error(f"❌ アップロードエラー：{e}")
