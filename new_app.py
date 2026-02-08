@@ -28,10 +28,12 @@ DEEPL_TO_YT_LANG_MAP = {
 }
 DEEPL_LANGUAGES = list(DEEPL_TO_YT_LANG_MAP.keys())
 
+
 def shorten_text(text, max_length=100):
     if len(text) <= max_length:
         return text
     return text[:max_length - 1] + "…"
+
 
 deepl_key = st.text_input("🔑 DeepL APIキー", type="password")
 video_url = st.text_input("📺 YouTube 動画 URL または ID")
@@ -54,8 +56,11 @@ if st.button("🚀 翻訳＆アップロード開始"):
         redirect_uri=REDIRECT_URI
     )
 
-    query_params = st.experimental_get_query_params()
-    if "code" not in query_params:
+    # ===== 修正ポイントここから =====
+    query_params = st.query_params
+    code = query_params.get("code")
+
+    if not code:
         auth_url, _ = flow.authorization_url(
             prompt="consent",
             access_type="offline",
@@ -65,8 +70,12 @@ if st.button("🚀 翻訳＆アップロード開始"):
         st.markdown(f"➡️ [Googleでログイン]({auth_url})")
         st.stop()
 
+    if isinstance(code, list):
+        code = code[0]
+    # ===== 修正ポイントここまで =====
+
     try:
-        flow.fetch_token(code=query_params["code"][0])
+        flow.fetch_token(code=code)
         creds = flow.credentials
         youtube = build("youtube", "v3", credentials=creds)
     except Exception as e:
@@ -104,12 +113,20 @@ if st.button("🚀 翻訳＆アップロード開始"):
         try:
             yt_lang = DEEPL_TO_YT_LANG_MAP[deepl_lang]
 
-            translated_title = translator.translate_text(orig_title, target_lang=deepl_lang).text
-            translated_title = translated_title.encode("utf-8", errors="ignore").decode("utf-8")
+            translated_title = translator.translate_text(
+                orig_title, target_lang=deepl_lang
+            ).text
+            translated_title = translated_title.encode(
+                "utf-8", errors="ignore"
+            ).decode("utf-8")
             translated_title = shorten_text(translated_title, 100)
 
-            translated_desc = translator.translate_text(orig_desc, target_lang=deepl_lang).text
-            translated_desc = translated_desc.encode("utf-8", errors="ignore").decode("utf-8")
+            translated_desc = translator.translate_text(
+                orig_desc, target_lang=deepl_lang
+            ).text
+            translated_desc = translated_desc.encode(
+                "utf-8", errors="ignore"
+            ).decode("utf-8")
 
             localizations[yt_lang] = {
                 "title": translated_title,
