@@ -1,5 +1,6 @@
 import streamlit as st
 import json
+import re
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -18,8 +19,6 @@ CATEGORY_MAP = {
     "教育": "27", "自動車と乗り物": "2", "非営利団体と社会活動": "29", "旅行とイベント": "19"
 }
 
-# まずは DeepLターゲット一覧として保持しつつ、
-# 実際に YouTubeへ入れる言語コードは後段で「YouTube対応一覧」でフィルタします
 DEEPL_TO_YT_LANG_MAP = {
     "BG": "bg", "CS": "cs", "DA": "da", "DE": "de", "EL": "el",
     "EN-US": "en", "EN-GB": "en",
@@ -35,11 +34,30 @@ DEEPL_TO_YT_LANG_MAP = {
 }
 DEEPL_LANGUAGES = list(DEEPL_TO_YT_LANG_MAP.keys())
 
+YT_TITLE_MAX = 100
+YT_DESC_MAX = 5000
 
-def shorten_text(text, max_length=100):
-    if len(text) <= max_length:
-        return text
-    return text[:max_length - 1] + "…"
+# 制御文字を除去（改行/タブは残す）
+CONTROL_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+
+def sanitize_text(text: str, max_len: int) -> str:
+    if text is None:
+        return ""
+    # 変な制御文字を消す
+    text = CONTROL_CHARS.sub("", text)
+    # 念のためUTF-8化（壊れた文字を落とす）
+    text = text.encode("utf-8", errors="ignore").decode("utf-8")
+    # 長さ制限
+    if len(text) > max_len:
+        text = text[:max_len]
+    return text
+
+def shorten_title(text: str) -> str:
+    text = sanitize_text(text, YT_TITLE_MAX)
+    # 100ちょうどで切った時に末尾が不自然なら “…” に置換（任意）
+    if len(text) == YT_TITLE_MAX:
+        text = text[:-1] + "…"
+    return text
 
 
 deepl_key = st.text_input("🔑 DeepL APIキー", type="password")
@@ -63,7 +81,6 @@ if st.button("🚀 翻訳＆アップロード開始"):
         redirect_uri=REDIRECT_URI
     )
 
-    # Streamlit の新方式
     query_params = st.query_params
     code = query_params.get("code")
 
@@ -88,7 +105,7 @@ if st.button("🚀 翻訳＆アップロード開始"):
         st.error(f"🚫 Google 認証エラー：{e}")
         st.stop()
 
-    # ★ YouTubeが受け付ける言語コード一覧を取得（最重要）
+    # YouTubeが受け付ける言語コード一覧を取得
     try:
         lang_resp = youtube.i18nLanguages().list(part="snippet").execute()
         YT_SUPPORTED_LANGS = set(item["snippet"]["hl"] for item in lang_resp.get("items", []))
@@ -116,6 +133,11 @@ if st.button("🚀 翻訳＆アップロード開始"):
         snippet = video_response["items"][0]["snippet"]
         orig_title = snippet.get("title", "")
         orig_desc = snippet.get("description", "")
+
+        # 念のためYouTube制限に合わせて整形
+        orig_title = shorten_title(orig_title)
+        orig_desc = sanitize_text(orig_desc, YT_DESC_MAX)
+
         st.success("🎬 動画情報を取得しました")
 
     except HttpError as e:
@@ -127,7 +149,7 @@ if st.button("🚀 翻訳＆アップロード開始"):
         try:
             yt_lang = DEEPL_TO_YT_LANG_MAP[deepl_lang]
 
-            # defaultLanguage=ja を使うので ja は localizations に入れない（衝突回避）
+            # defaultLanguage=ja に任せたいので、ja は localizations に入れない
             if yt_lang == "ja":
                 continue
 
@@ -136,20 +158,20 @@ if st.button("🚀 翻訳＆アップロード開始"):
                 st.warning(f"{deepl_lang} → {yt_lang} はYouTube非対応のためスキップ")
                 continue
 
-            # 既に同じキーがある場合は上書きしない（en/pt の衝突回避）
+            # 同じキー（en/pt）重複は上書きしない
             if yt_lang in localizations:
                 continue
 
             translated_title = translator.translate_text(orig_title, target_lang=deepl_lang).text
-            translated_title = translated_title.encode("utf-8", errors="ignore").decode("utf-8")
-            translated_title = shorten_text(translated_title, 100)
+            translated_desc = translator.translate_text(orig_desc, target_lang=deepl_lang).text
+
+            # YouTube制限に合わせて整形（ここが今回の本命対策）
+            translated_title = shorten_title(translated_title)
+            translated_desc = sanitize_text(translated_desc, YT_DESC_MAX)
 
             if not translated_title.strip():
                 st.warning(f"{deepl_lang} はタイトルが空になったためスキップ")
                 continue
-
-            translated_desc = translator.translate_text(orig_desc, target_lang=deepl_lang).text
-            translated_desc = translated_desc.encode("utf-8", errors="ignore").decode("utf-8")
 
             localizations[yt_lang] = {
                 "title": translated_title,
@@ -166,9 +188,29 @@ if st.button("🚀 翻訳＆アップロード開始"):
     st.subheader("■ 元の説明文")
     st.write(orig_desc)
 
-    # ★お願い：次の1回だけデバッグ表示（アップロード直前）
+    # デバッグ（前回どおり）
     st.write("DEBUG: localizations keys:", list(localizations.keys()))
 
+    # まず snippet だけ更新して通るかテスト（原因切り分け）
+    try:
+        youtube.videos().update(
+            part="snippet",
+            body={
+                "id": vid,
+                "snippet": {
+                    "title": orig_title,
+                    "description": orig_desc,
+                    "categoryId": CATEGORY_MAP[category]
+                    # defaultLanguage は一旦外す（不一致で落ちるケース回避）
+                }
+            }
+        ).execute()
+        st.success("✅ snippet更新テスト: 成功（localizations が原因側の可能性が高い）")
+    except Exception as e:
+        st.error(f"🚫 snippet更新テストで失敗（localizations以前の問題）: {e}")
+        st.stop()
+
+    # 本番：snippet + localizations
     try:
         youtube.videos().update(
             part="snippet,localizations",
@@ -177,8 +219,7 @@ if st.button("🚀 翻訳＆アップロード開始"):
                 "snippet": {
                     "title": orig_title,
                     "description": orig_desc,
-                    "categoryId": CATEGORY_MAP[category],
-                    "defaultLanguage": "ja"
+                    "categoryId": CATEGORY_MAP[category]
                 },
                 "localizations": localizations
             }
