@@ -18,14 +18,54 @@ CATEGORY_MAP = {
     "教育": "27", "自動車と乗り物": "2", "非営利団体と社会活動": "29", "旅行とイベント": "19"
 }
 
+# YouTube localizations のキーは BCP-47 言語コードが必須（重複キーもNGになりやすい）
+# ここを「衝突しない」&「YouTubeが受け入れやすい」形に修正
 DEEPL_TO_YT_LANG_MAP = {
-    "BG": "bg", "CS": "cs", "DA": "da", "DE": "de", "EL": "el", "EN-US": "en",
-    "EN-GB": "en", "ES": "es", "ET": "et", "FI": "fi", "FR": "fr", "HU": "hu",
-    "ID": "id", "IT": "it", "JA": "ja", "KO": "ko", "LT": "lt", "LV": "lv",
-    "NB": "no", "NL": "nl", "PL": "pl", "PT-BR": "pt", "PT-PT": "pt",
-    "RO": "ro", "RU": "ru", "SK": "sk", "SL": "sl", "SV": "sv", "TR": "tr",
-    "UK": "uk", "ZH": "zh"
+    "BG": "bg",
+    "CS": "cs",
+    "DA": "da",
+    "DE": "de",
+    "EL": "el",
+
+    # en を潰さない（en-US / en-GB として別キーにする）
+    "EN-US": "en-US",
+    "EN-GB": "en-GB",
+
+    "ES": "es",
+    "ET": "et",
+    "FI": "fi",
+    "FR": "fr",
+    "HU": "hu",
+    "ID": "id",
+    "IT": "it",
+
+    # defaultLanguage=ja を使うので localizations の ja は作らない（後で skip）
+    "JA": "ja",
+
+    "KO": "ko",
+    "LT": "lt",
+    "LV": "lv",
+
+    "NB": "no",
+    "NL": "nl",
+    "PL": "pl",
+
+    # pt を潰さない（pt-BR / pt-PT）
+    "PT-BR": "pt-BR",
+    "PT-PT": "pt-PT",
+
+    "RO": "ro",
+    "RU": "ru",
+    "SK": "sk",
+    "SL": "sl",
+    "SV": "sv",
+    "TR": "tr",
+    "UK": "uk",
+
+    # zh は曖昧なので zh-Hans に寄せる（DeepLのZHは簡体/繁体指定できないため）
+    "ZH": "zh-Hans"
 }
+
 DEEPL_LANGUAGES = list(DEEPL_TO_YT_LANG_MAP.keys())
 
 
@@ -56,7 +96,7 @@ if st.button("🚀 翻訳＆アップロード開始"):
         redirect_uri=REDIRECT_URI
     )
 
-    # ===== 修正ポイントここから =====
+    # Streamlit の新方式
     query_params = st.query_params
     code = query_params.get("code")
 
@@ -72,7 +112,6 @@ if st.button("🚀 翻訳＆アップロード開始"):
 
     if isinstance(code, list):
         code = code[0]
-    # ===== 修正ポイントここまで =====
 
     try:
         flow.fetch_token(code=code)
@@ -109,24 +148,21 @@ if st.button("🚀 翻訳＆アップロード開始"):
         st.stop()
 
     localizations = {}
+
     for deepl_lang in DEEPL_LANGUAGES:
         try:
             yt_lang = DEEPL_TO_YT_LANG_MAP[deepl_lang]
 
-            translated_title = translator.translate_text(
-                orig_title, target_lang=deepl_lang
-            ).text
-            translated_title = translated_title.encode(
-                "utf-8", errors="ignore"
-            ).decode("utf-8")
+            # defaultLanguage=ja を使う場合、localizations に ja を入れない方が安全
+            if yt_lang == "ja":
+                continue
+
+            translated_title = translator.translate_text(orig_title, target_lang=deepl_lang).text
+            translated_title = translated_title.encode("utf-8", errors="ignore").decode("utf-8")
             translated_title = shorten_text(translated_title, 100)
 
-            translated_desc = translator.translate_text(
-                orig_desc, target_lang=deepl_lang
-            ).text
-            translated_desc = translated_desc.encode(
-                "utf-8", errors="ignore"
-            ).decode("utf-8")
+            translated_desc = translator.translate_text(orig_desc, target_lang=deepl_lang).text
+            translated_desc = translated_desc.encode("utf-8", errors="ignore").decode("utf-8")
 
             localizations[yt_lang] = {
                 "title": translated_title,
@@ -140,10 +176,15 @@ if st.button("🚀 翻訳＆アップロード開始"):
 
     st.subheader("■ 元のタイトル")
     st.write(orig_title)
+
+    # 表示用：日本語は localizations からは取れない（skip してる）ので orig を見せる
     st.subheader("■ 翻訳後タイトル（日本語）")
-    st.write(localizations.get("ja", {}).get("title", ""))
+    st.write(orig_title)
     st.subheader("■ 翻訳後説明文（日本語）")
-    st.write(localizations.get("ja", {}).get("description", ""))
+    st.write(orig_desc)
+
+    # 送信直前の確認（必要なら一時的にON）
+    # st.write("送信するlocalizations:", localizations)
 
     try:
         youtube.videos().update(
