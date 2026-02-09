@@ -40,10 +40,16 @@ YT_DESC_MAX = 5000
 # 制御文字を除去（改行/タブは残す）
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
 
+# URLだけの行は翻訳しない（改行崩れ防止＆リンク保持）
+URL_LINE = re.compile(r"^\s*(https?://\S+)\s*$")
+
+
 def sanitize_text(text: str, max_len: int) -> str:
     if text is None:
         return ""
-    # 変な制御文字を消す
+    # 改行コードを統一
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # 変な制御文字を消す（改行は残す）
     text = CONTROL_CHARS.sub("", text)
     # 念のためUTF-8化（壊れた文字を落とす）
     text = text.encode("utf-8", errors="ignore").decode("utf-8")
@@ -52,12 +58,48 @@ def sanitize_text(text: str, max_len: int) -> str:
         text = text[:max_len]
     return text
 
+
 def shorten_title(text: str) -> str:
     text = sanitize_text(text, YT_TITLE_MAX)
-    # 100ちょうどで切った時に末尾が不自然なら “…” に置換（任意）
     if len(text) == YT_TITLE_MAX:
         text = text[:-1] + "…"
     return text
+
+
+def translate_preserve_newlines(translator: deepl.Translator, text: str, target_lang: str) -> str:
+    """
+    改行構造を絶対に壊さない翻訳:
+    - 空行は空行のまま
+    - URLだけの行は翻訳しない
+    - それ以外は1行ずつDeepL翻訳（preserve_formatting=True）
+    """
+    text = sanitize_text(text, YT_DESC_MAX)  # まず危険文字と改行を整える
+    lines = text.split("\n")
+    out_lines = []
+
+    for line in lines:
+        if line.strip() == "":
+            out_lines.append("")
+            continue
+
+        if URL_LINE.match(line):
+            out_lines.append(line.strip())
+            continue
+
+        t = translator.translate_text(
+            line,
+            target_lang=target_lang,
+            preserve_formatting=True
+        ).text
+
+        # 1行翻訳した結果にも一応サニタイズをかける（行単位なのでmaxは大きめでOK）
+        t = sanitize_text(t, 2000).replace("\n", " ")
+        out_lines.append(t)
+
+    # 結合後、最終的に5000文字に収める（YouTube制限）
+    result = "\n".join(out_lines)
+    result = sanitize_text(result, YT_DESC_MAX)
+    return result
 
 
 deepl_key = st.text_input("🔑 DeepL APIキー", type="password")
@@ -134,7 +176,7 @@ if st.button("🚀 翻訳＆アップロード開始"):
         orig_title = snippet.get("title", "")
         orig_desc = snippet.get("description", "")
 
-        # 念のためYouTube制限に合わせて整形
+        # 念のためYouTube制限に合わせて整形（改行も統一）
         orig_title = shorten_title(orig_title)
         orig_desc = sanitize_text(orig_desc, YT_DESC_MAX)
 
@@ -162,10 +204,21 @@ if st.button("🚀 翻訳＆アップロード開始"):
             if yt_lang in localizations:
                 continue
 
-            translated_title = translator.translate_text(orig_title, target_lang=deepl_lang).text
-            translated_desc = translator.translate_text(orig_desc, target_lang=deepl_lang).text
+            # タイトルは通常翻訳（フォーマット保持）
+            translated_title = translator.translate_text(
+                orig_title,
+                target_lang=deepl_lang,
+                preserve_formatting=True
+            ).text
 
-            # YouTube制限に合わせて整形（ここが今回の本命対策）
+            # 説明文は「改行保持」で翻訳（ここが改行崩れの本命対策）
+            translated_desc = translate_preserve_newlines(
+                translator,
+                orig_desc,
+                deepl_lang
+            )
+
+            # YouTube制限に合わせて整形
             translated_title = shorten_title(translated_title)
             translated_desc = sanitize_text(translated_desc, YT_DESC_MAX)
 
@@ -188,7 +241,7 @@ if st.button("🚀 翻訳＆アップロード開始"):
     st.subheader("■ 元の説明文")
     st.write(orig_desc)
 
-    # デバッグ（前回どおり）
+    # デバッグ（必要なら残してOK）
     st.write("DEBUG: localizations keys:", list(localizations.keys()))
 
     # まず snippet だけ更新して通るかテスト（原因切り分け）
@@ -201,7 +254,6 @@ if st.button("🚀 翻訳＆アップロード開始"):
                     "title": orig_title,
                     "description": orig_desc,
                     "categoryId": CATEGORY_MAP[category]
-                    # defaultLanguage は一旦外す（不一致で落ちるケース回避）
                 }
             }
         ).execute()
