@@ -1,6 +1,9 @@
 import streamlit as st
 import json
 import re
+import os
+import base64
+import hashlib
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -60,7 +63,6 @@ def translate_preserve_newlines(translator: deepl.Translator, text: str, target_
     text = sanitize_text(text, YT_DESC_MAX)
     lines = text.split("\n")
     out_lines = []
-
     for line in lines:
         if line.strip() == "":
             out_lines.append("")
@@ -68,126 +70,143 @@ def translate_preserve_newlines(translator: deepl.Translator, text: str, target_
         if URL_LINE.match(line):
             out_lines.append(line.strip())
             continue
-
         t = translator.translate_text(
             line,
             target_lang=target_lang,
             preserve_formatting=True
         ).text
-
         t = sanitize_text(t, 2000).replace("\n", " ")
         out_lines.append(t)
-
     result = "\n".join(out_lines)
     result = sanitize_text(result, YT_DESC_MAX)
     return result
 
-# ---------------------------
-# OAuth（PKCE）を壊さない実装
-# ---------------------------
 
-def _get_client_config_dict() -> dict:
-    # secretsは文字列JSONなのでdict化
-    d = json.loads(CLIENT_SECRET_JSON)
-    return d
+# ===========================
+# OAuth (PKCE復元方式) ここが修正の本体
+# ===========================
 
-def _get_redirect_uri() -> str:
-    # Cloud版のURLは「Google Cloud Consoleの承認済みリダイレクトURI」と完全一致させる
-    # 末尾スラッシュが付いている/いないも一致が必要なことがあります
+def _client_config_dict() -> dict:
+    return json.loads(CLIENT_SECRET_JSON)
+
+def _redirect_uri() -> str:
+    # Google Cloud Console の「承認済みリダイレクトURI」と完全一致させる
     return "https://universe-translator-youtube.streamlit.app/"
 
-def _ensure_flow():
-    if "oauth_flow" not in st.session_state:
-        st.session_state.oauth_flow = Flow.from_client_config(
-            client_config=_get_client_config_dict(),
-            scopes=SCOPES,
-            redirect_uri=_get_redirect_uri()
-        )
+def _b64url(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode("utf-8").rstrip("=")
 
-def _start_login():
-    _ensure_flow()
-    auth_url, state = st.session_state.oauth_flow.authorization_url(
+def _b64url_decode(s: str) -> bytes:
+    s = s + "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s.encode("utf-8"))
+
+def _new_code_verifier() -> str:
+    # 43〜128文字程度のURL-safe
+    return _b64url(os.urandom(64))
+
+def _code_challenge_s256(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode("utf-8")).digest()
+    return _b64url(digest)
+
+def _make_flow() -> Flow:
+    return Flow.from_client_config(
+        client_config=_client_config_dict(),
+        scopes=SCOPES,
+        redirect_uri=_redirect_uri()
+    )
+
+def build_auth_url() -> str:
+    flow = _make_flow()
+
+    verifier = _new_code_verifier()
+    challenge = _code_challenge_s256(verifier)
+
+    # state に verifier を埋め込む（セッションが消えても復元できる）
+    state_payload = {"v": verifier}
+    state = _b64url(json.dumps(state_payload).encode("utf-8"))
+
+    auth_url, _ = flow.authorization_url(
         prompt="consent",
         access_type="offline",
-        include_granted_scopes="true"
+        include_granted_scopes="true",
+        state=state,
+        code_challenge=challenge,
+        code_challenge_method="S256",
     )
-    st.session_state.oauth_state = state
     return auth_url
 
-def _try_finish_login_from_callback():
-    """
-    URLに ?code=... が来ていたら token 交換する。
-    ここで「認証開始時と同じflow」を使うのがPKCE必須条件。
-    """
-    qp = st.query_params
-    code = qp.get("code")
-    if not code:
-        return False
+def exchange_code_for_youtube(code: str, state: str):
+    # state から verifier を復元
+    payload = json.loads(_b64url_decode(state).decode("utf-8"))
+    verifier = payload["v"]
 
-    if isinstance(code, list):
-        code = code[0]
+    flow = _make_flow()
+    flow.code_verifier = verifier  # ← ここが Missing code verifier 根絶ポイント
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+    youtube = build("youtube", "v3", credentials=creds)
+    return youtube, creds
 
-    _ensure_flow()
+# ===========================
+# ログイン処理（先に確定させる）
+# ===========================
 
-    # state を保持しているなら戻す（任意だけど推奨）
-    if "oauth_state" in st.session_state:
-        st.session_state.oauth_flow.state = st.session_state.oauth_state
+st.subheader("1) Googleログイン")
 
+qp = st.query_params
+code = qp.get("code")
+state = qp.get("state")
+
+if isinstance(code, list):
+    code = code[0]
+if isinstance(state, list):
+    state = state[0]
+
+if "yt_creds_json" not in st.session_state:
+    st.session_state.yt_creds_json = None
+
+# コールバックが来ているなら、ここで認証を完了させる
+if code and state and st.session_state.yt_creds_json is None:
     try:
-        st.session_state.oauth_flow.fetch_token(code=code)
-        creds = st.session_state.oauth_flow.credentials
+        youtube, creds = exchange_code_for_youtube(code, state)
         st.session_state.yt_creds_json = creds.to_json()
+        st.success("✅ Google認証OK")
 
-        # codeが残ると再実行でまたfetch_tokenしようとして事故るので消す
+        # URLにcode/stateが残ると再実行で事故るので消す
         try:
             st.query_params.clear()
         except Exception:
             pass
 
-        st.success("✅ Google認証OK")
         st.rerun()
-        return True
     except Exception as e:
         st.error(f"🚫 Google 認証エラー：{e}")
-        return False
+        st.stop()
 
-def _get_youtube_client_or_none():
-    if "yt_creds_json" not in st.session_state:
-        return None
-    # buildは credentials オブジェクトが必要なので flow から復元するのが簡単
-    # ここでは flow を再利用して credentials を入れ直す
-    _ensure_flow()
+# 認証済みなら youtube クライアントを復元
+youtube = None
+if st.session_state.yt_creds_json:
     try:
-        st.session_state.oauth_flow.credentials = st.session_state.oauth_flow.credentials.from_authorized_user_info(
-            json.loads(st.session_state.yt_creds_json),
-            scopes=SCOPES
-        )
+        # credentials を flow 経由ではなく AuthorizedUserInfo から復元
+        from google.oauth2.credentials import Credentials
+        info = json.loads(st.session_state.yt_creds_json)
+        creds = Credentials.from_authorized_user_info(info, scopes=SCOPES)
+        youtube = build("youtube", "v3", credentials=creds)
+        st.success("ログイン済みです")
     except Exception:
-        # from_authorized_user_info が環境によってコケる場合は、再ログインさせる
-        return None
+        st.session_state.yt_creds_json = None
+        youtube = None
 
-    try:
-        youtube = build("youtube", "v3", credentials=st.session_state.oauth_flow.credentials)
-        return youtube
-    except Exception:
-        return None
-
-# まずコールバック処理を先に実行（codeが来てるならここで確定）
-_try_finish_login_from_callback()
-
-# UI: ログインセクション
-st.subheader("1) Googleログイン")
-
-youtube = _get_youtube_client_or_none()
 if youtube is None:
-    auth_url = _start_login()
+    auth_url = build_auth_url()
     st.info("下のボタンからGoogle認証に進んでください（認証後、自動でこの画面に戻ります）")
     st.link_button("Googleでログイン", auth_url)
     st.stop()
-else:
-    st.success("ログイン済みです")
 
-# ここから先はログイン済みで進む
+# ===========================
+# ここから翻訳＆アップロード（元のロジックほぼそのまま）
+# ===========================
+
 st.subheader("2) 翻訳＆アップロード")
 
 deepl_key = st.text_input("🔑 DeepL APIキー", type="password")
@@ -202,7 +221,7 @@ if st.button("🚀 翻訳＆アップロード開始"):
         st.error("⚠️ YouTube 動画 URL/ID を入力してください。")
         st.stop()
 
-    # YouTubeが受け付ける言語コード一覧を取得
+    # YouTube対応言語一覧
     try:
         lang_resp = youtube.i18nLanguages().list(part="snippet").execute()
         YT_SUPPORTED_LANGS = set(item["snippet"]["hl"] for item in lang_resp.get("items", []))
@@ -210,17 +229,20 @@ if st.button("🚀 翻訳＆アップロード開始"):
         YT_SUPPORTED_LANGS = set()
         st.warning(f"⚠️ YouTube対応言語コード一覧の取得に失敗（フィルタなしで続行）: {e}")
 
+    # DeepL
     try:
         translator = deepl.Translator(deepl_key)
     except Exception as e:
         st.error(f"🚫 DeepL 認証エラー：{e}")
         st.stop()
 
+    # ID抽出
     if "v=" in video_url:
         vid = video_url.split("v=")[-1].split("&")[0]
     else:
         vid = video_url.strip()
 
+    # 動画情報
     try:
         video_response = youtube.videos().list(part="snippet", id=vid).execute()
         if not video_response.get("items"):
@@ -236,13 +258,13 @@ if st.button("🚀 翻訳＆アップロード開始"):
         st.error(f"🚫 動画情報取得エラー：{e}")
         st.stop()
 
-    # 翻訳（Broken pipe対策で出力を減らす）
+    # 翻訳
     localizations = {}
     total = len(DEEPL_LANGUAGES)
     prog = st.progress(0)
     log = st.empty()
-
     done = 0
+
     for deepl_lang in DEEPL_LANGUAGES:
         done += 1
         prog.progress(int(done / total * 100))
