@@ -315,7 +315,7 @@ except HttpError as e:
 st.subheader("2) 翻訳＆アップロード")
 
 deepl_key = st.text_input("🔑 DeepL APIキー", type="password")
-video_url = st.text_input("📺 YouTube 動画 URL または ID", value="33e3z5SLYfc")
+video_url = st.text_input("📺 YouTube 動画 URL または ID")
 category = st.selectbox("🎯 動画のカテゴリを選択", list(CATEGORY_MAP.keys()))
 
 if st.button("🚀 翻訳＆アップロード開始"):
