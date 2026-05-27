@@ -4,6 +4,7 @@ import re
 import os
 import base64
 import hashlib
+import hmac
 import stripe
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
@@ -139,10 +140,6 @@ def show_youtube_http_error(action: str, error: HttpError):
         st.code(str(error))
 
 
-# ===========================
-# Stripe会員判定
-# ===========================
-
 def is_admin_user(email: str) -> bool:
     return email.lower() in ADMIN_EMAILS
 
@@ -189,10 +186,6 @@ def create_checkout_url(email: str) -> str:
     return session.url
 
 
-# ===========================
-# OAuth
-# ===========================
-
 def _client_config_dict() -> dict:
     return json.loads(CLIENT_SECRET_JSON)
 
@@ -208,6 +201,29 @@ def _b64url(b: bytes) -> str:
 def _b64url_decode(s: str) -> bytes:
     s = s + "=" * (-len(s) % 4)
     return base64.urlsafe_b64decode(s.encode("utf-8"))
+
+
+def _state_signature(payload: dict) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    key = STRIPE_SECRET_KEY.encode("utf-8")
+    return _b64url(hmac.new(key, raw, hashlib.sha256).digest())
+
+
+def _encode_state(payload: dict) -> str:
+    signed_payload = dict(payload)
+    signed_payload["sig"] = _state_signature(payload)
+    return _b64url(json.dumps(signed_payload).encode("utf-8"))
+
+
+def _decode_state(state: str) -> dict:
+    payload = json.loads(_b64url_decode(state).decode("utf-8"))
+    sig = payload.pop("sig", "")
+
+    expected_sig = _state_signature(payload)
+    if not hmac.compare_digest(sig, expected_sig):
+        raise ValueError("認証情報の確認に失敗しました。もう一度ログインしてください。")
+
+    return payload
 
 
 def _new_code_verifier() -> str:
@@ -227,7 +243,7 @@ def _make_flow(scopes) -> Flow:
     )
 
 
-def build_auth_url(purpose: str, scopes) -> str:
+def build_auth_url(purpose: str, scopes, member_email: str = "") -> str:
     flow = _make_flow(scopes)
 
     verifier = _new_code_verifier()
@@ -236,8 +252,9 @@ def build_auth_url(purpose: str, scopes) -> str:
     state_payload = {
         "v": verifier,
         "purpose": purpose,
+        "member_email": member_email.lower(),
     }
-    state = _b64url(json.dumps(state_payload).encode("utf-8"))
+    state = _encode_state(state_payload)
 
     auth_url, _ = flow.authorization_url(
         prompt="consent",
@@ -251,7 +268,7 @@ def build_auth_url(purpose: str, scopes) -> str:
 
 
 def exchange_code(code: str, state: str):
-    payload = json.loads(_b64url_decode(state).decode("utf-8"))
+    payload = _decode_state(state)
     verifier = payload["v"]
     purpose = payload.get("purpose", "youtube")
 
@@ -261,7 +278,7 @@ def exchange_code(code: str, state: str):
     flow.code_verifier = verifier
     flow.fetch_token(code=code)
 
-    return purpose, flow.credentials
+    return purpose, flow.credentials, payload
 
 
 def get_google_email(creds) -> str:
@@ -288,10 +305,6 @@ def clear_youtube_login():
     clear_query_params()
 
 
-# ===========================
-# セッション初期化
-# ===========================
-
 if "member_creds_json" not in st.session_state:
     st.session_state.member_creds_json = None
 
@@ -301,10 +314,6 @@ if "member_email" not in st.session_state:
 if "yt_creds_json" not in st.session_state:
     st.session_state.yt_creds_json = None
 
-
-# ===========================
-# リダイレクト処理
-# ===========================
 
 qp = st.query_params
 code = qp.get("code")
@@ -325,13 +334,17 @@ elif payment == "cancel":
 
 if code and state:
     try:
-        purpose, creds = exchange_code(code, state)
+        purpose, creds, payload = exchange_code(code, state)
 
         if purpose == "member":
             st.session_state.member_creds_json = creds.to_json()
             st.session_state.member_email = get_google_email(creds)
             st.success("✅ UniVerse会員ログインOK")
         else:
+            member_email_from_state = payload.get("member_email", "").lower()
+            if member_email_from_state:
+                st.session_state.member_email = member_email_from_state
+
             st.session_state.yt_creds_json = creds.to_json()
             st.success("✅ YouTubeチャンネル接続OK")
 
@@ -343,13 +356,8 @@ if code and state:
         st.stop()
 
 
-# ===========================
-# 1) UniVerse会員ログイン
-# ===========================
-
 st.subheader("1) UniVerse会員ログイン")
 
-member_creds = None
 member_email = st.session_state.member_email
 
 if st.session_state.member_creds_json:
@@ -366,31 +374,31 @@ if st.session_state.member_creds_json:
         st.success("会員ログイン済みです")
         st.info(f"会員メール: {member_email}")
 
-        if member_email.endswith("@pages.plusgoogle.com"):
-            st.warning(
-                "ブランドアカウント側のメールで会員ログインされています。"
-                "ここでは本人のGmailでログインしてください。"
-            )
-
         if st.button("会員ログインをやり直す"):
             clear_member_login()
+            clear_youtube_login()
             st.rerun()
 
     except Exception as e:
         st.warning(f"会員ログイン情報を読み込めませんでした。再ログインしてください: {e}")
         clear_member_login()
-        member_creds = None
+        member_email = ""
 
-if member_creds is None:
+elif member_email:
+    st.success("会員ログイン済みです")
+    st.info(f"会員メール: {member_email}")
+
+    if st.button("会員ログインをやり直す"):
+        clear_member_login()
+        clear_youtube_login()
+        st.rerun()
+
+else:
     auth_url = build_auth_url("member", MEMBER_SCOPES)
     st.info("まず、月額会員として登録する本人のGoogleメールでログインしてください。")
     st.link_button("会員としてGoogleログイン", auth_url)
     st.stop()
 
-
-# ===========================
-# 2) 会員確認
-# ===========================
 
 st.subheader("2) 会員確認")
 
@@ -414,14 +422,9 @@ except Exception as e:
     st.stop()
 
 
-# ===========================
-# 3) YouTubeチャンネル接続
-# ===========================
-
 st.subheader("3) YouTubeチャンネル接続")
 
 youtube = None
-yt_creds = None
 
 if st.session_state.yt_creds_json:
     try:
@@ -443,15 +446,11 @@ if st.session_state.yt_creds_json:
         youtube = None
 
 if youtube is None:
-    auth_url = build_auth_url("youtube", YOUTUBE_SCOPES)
+    auth_url = build_auth_url("youtube", YOUTUBE_SCOPES, member_email)
     st.info("次に、翻訳を反映したいYouTubeチャンネルまたはブランドアカウントを接続してください。")
     st.link_button("YouTubeチャンネルを接続", auth_url)
     st.stop()
 
-
-# ===========================
-# 認証チャンネル確認
-# ===========================
 
 try:
     channel_resp = youtube.channels().list(part="snippet", mine=True).execute()
@@ -480,10 +479,6 @@ except HttpError as e:
 
     st.stop()
 
-
-# ===========================
-# 4) 翻訳＆アップロード
-# ===========================
 
 st.subheader("4) 翻訳＆アップロード")
 
