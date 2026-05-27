@@ -4,6 +4,7 @@ import re
 import os
 import base64
 import hashlib
+import stripe
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -12,8 +13,19 @@ import deepl
 st.set_page_config(page_title="UniVerse — YouTube多言語翻訳アプリ", layout="wide")
 st.title("UniVerse — YouTube多言語翻訳アプリ")
 
-SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"]
+SCOPES = [
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/youtube.force-ssl",
+]
+
 CLIENT_SECRET_JSON = st.secrets["CLIENT_SECRET_JSON"]
+
+STRIPE_SECRET_KEY = st.secrets["STRIPE_SECRET_KEY"]
+STRIPE_PRICE_ID = st.secrets["STRIPE_PRICE_ID"]
+ADMIN_EMAILS = {"sukidesuchofu69@gmail.com"}
+
+stripe.api_key = STRIPE_SECRET_KEY
 
 CATEGORY_MAP = {
     "エンターテイメント": "24", "ゲーム": "20", "コメディ": "23", "スポーツ": "17",
@@ -94,9 +106,7 @@ def translate_preserve_newlines(translator: deepl.Translator, text: str, target_
         t = sanitize_text(t, 2000).replace("\n", " ")
         out_lines.append(t)
 
-    result = "\n".join(out_lines)
-    result = sanitize_text(result, YT_DESC_MAX)
-    return result
+    return sanitize_text("\n".join(out_lines), YT_DESC_MAX)
 
 
 def get_youtube_error_reason(error: HttpError) -> str:
@@ -118,16 +128,62 @@ def show_youtube_http_error(action: str, error: HttpError):
 
     if status == 401:
         st.warning("認証アカウント、YouTubeチャンネル、またはOAuth認証情報に問題がある可能性があります。")
-
         if reason == "youtubeSignupRequired":
             st.info(YOUTUBE_SIGNUP_REQUIRED_HELP)
         else:
-            st.info(
-                "Google認証情報が古い、scopeが不足している、または別のGoogleアカウントで"
-                "認証している可能性があります。再認証ボタンを押して認証をやり直してください。"
-            )
+            st.info("再認証ボタンを押して、Google認証をやり直してください。")
     else:
         st.code(str(error))
+
+
+# ===========================
+# Stripe会員判定
+# ===========================
+
+def is_admin_user(email: str) -> bool:
+    return email.lower() in ADMIN_EMAILS
+
+
+def is_paid_member(email: str) -> bool:
+    email = email.lower()
+
+    if is_admin_user(email):
+        return True
+
+    customers = stripe.Customer.list(email=email, limit=10)
+
+    for customer in customers.data:
+        subscriptions = stripe.Subscription.list(
+            customer=customer.id,
+            status="all",
+            limit=20,
+        )
+
+        for subscription in subscriptions.data:
+            if subscription.status not in ["active", "trialing"]:
+                continue
+
+            for item in subscription["items"]["data"]:
+                if item["price"]["id"] == STRIPE_PRICE_ID:
+                    return True
+
+    return False
+
+
+def create_checkout_url(email: str) -> str:
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        customer_email=email,
+        line_items=[
+            {
+                "price": STRIPE_PRICE_ID,
+                "quantity": 1,
+            }
+        ],
+        success_url=_redirect_uri() + "?payment=success",
+        cancel_url=_redirect_uri() + "?payment=cancel",
+    )
+    return session.url
 
 
 # ===========================
@@ -201,6 +257,12 @@ def exchange_code_for_youtube(code: str, state: str):
     return youtube, creds
 
 
+def get_google_email(creds) -> str:
+    oauth2 = build("oauth2", "v2", credentials=creds)
+    userinfo = oauth2.userinfo().get().execute()
+    return userinfo.get("email", "").lower()
+
+
 def clear_login():
     st.session_state.yt_creds_json = None
     st.session_state.yt_channel_checked = False
@@ -219,11 +281,19 @@ st.subheader("1) Googleログイン")
 qp = st.query_params
 code = qp.get("code")
 state = qp.get("state")
+payment = qp.get("payment")
 
 if isinstance(code, list):
     code = code[0]
 if isinstance(state, list):
     state = state[0]
+if isinstance(payment, list):
+    payment = payment[0]
+
+if payment == "success":
+    st.success("決済ありがとうございます。反映後、会員機能が利用できます。")
+elif payment == "cancel":
+    st.info("決済はキャンセルされました。")
 
 if "yt_creds_json" not in st.session_state:
     st.session_state.yt_creds_json = None
@@ -249,6 +319,8 @@ if code and state and st.session_state.yt_creds_json is None:
         st.stop()
 
 youtube = None
+creds = None
+user_email = ""
 
 if st.session_state.yt_creds_json:
     try:
@@ -257,8 +329,10 @@ if st.session_state.yt_creds_json:
         info = json.loads(st.session_state.yt_creds_json)
         creds = Credentials.from_authorized_user_info(info, scopes=SCOPES)
         youtube = build("youtube", "v3", credentials=creds)
+        user_email = get_google_email(creds)
 
         st.success("ログイン済みです")
+        st.info(f"ログイン中のGoogleメール: {user_email}")
 
         if st.button("Google認証をやり直す"):
             clear_login()
@@ -273,6 +347,28 @@ if youtube is None:
     auth_url = build_auth_url()
     st.info("下のボタンからGoogle認証に進んでください。認証後、自動でこの画面に戻ります。")
     st.link_button("Googleでログイン", auth_url)
+    st.stop()
+
+
+# ===========================
+# 会員チェック
+# ===========================
+
+st.subheader("2) 会員確認")
+
+try:
+    if is_admin_user(user_email):
+        st.success("開発者アカウントとして認証されています。")
+    elif is_paid_member(user_email):
+        st.success("月額会員として認証されています。")
+    else:
+        st.warning("UniVerseは月額会員専用アプリです。")
+        checkout_url = create_checkout_url(user_email)
+        st.link_button("月額プランに登録する", checkout_url)
+        st.stop()
+
+except Exception as e:
+    st.error(f"Stripe会員確認でエラーが発生しました: {e}")
     st.stop()
 
 
@@ -312,7 +408,7 @@ except HttpError as e:
 # 翻訳＆アップロード
 # ===========================
 
-st.subheader("2) 翻訳＆アップロード")
+st.subheader("3) 翻訳＆アップロード")
 
 deepl_key = st.text_input("🔑 DeepL APIキー", type="password")
 video_url = st.text_input("📺 YouTube 動画 URL または ID")
