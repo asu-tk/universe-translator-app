@@ -4,3 +4,5 @@ google-api-python-client
 deepl
 python-dotenv
 stripe
+supabase
+cryptography
