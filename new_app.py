@@ -55,7 +55,8 @@ DEEPL_TO_YT_LANG_MAP = {
     "PT-BR": "pt", "PT-PT": "pt",
     "RO": "ro", "RU": "ru", "SK": "sk", "SL": "sl", "SV": "sv", "TR": "tr",
     "UK": "uk",
-    "ZH": "zh"
+    "ZH-HANS": "zh-Hans",
+    "ZH-HANT": "zh-Hant"
 }
 DEEPL_LANGUAGES = list(DEEPL_TO_YT_LANG_MAP.keys())
 
